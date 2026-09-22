@@ -7,7 +7,7 @@ from fastapi import FastAPI
 
 from .config import ensure_dirs, get_settings
 from .db import init_db
-from .routers import archives, sessions
+from .routers import archives, sessions, shares
 from .service import recover_after_restart
 
 
@@ -24,16 +24,18 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Large File Archive API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "Resumable chunked uploads with per-chunk SHA-256 verification, "
-        "atomic merge, whole-file hash validation and content-addressed dedup."
+        "atomic merge, whole-file hash validation, content-addressed dedup "
+        "and controlled share downloads (expiring, quota-limited tokens)."
     ),
     lifespan=lifespan,
 )
 
 app.include_router(sessions.router, prefix="/v1/sessions", tags=["sessions"])
 app.include_router(archives.router, prefix="/v1/archives", tags=["archives"])
+app.include_router(shares.router)
 
 
 @app.get("/healthz", tags=["meta"])

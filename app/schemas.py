@@ -90,3 +90,27 @@ class DeleteSessionResponse(BaseModel):
     deleted: bool
     archive_released: bool = Field(description="The session held an archive reference that was released")
     archive_deleted: bool = Field(description="The archive object was removed (refcount reached zero)")
+
+
+class CreateShareRequest(BaseModel):
+    expires_in: int = Field(
+        ge=1, le=2_592_000, description="Share lifetime in seconds (max 30 days)"
+    )
+    max_downloads: int = Field(
+        ge=1, le=10_000, description="Maximum number of allowed downloads"
+    )
+
+
+class ShareResponse(BaseModel):
+    token: str = Field(
+        description="Download token, returned only here; the server stores just its hash"
+    )
+    archive_sha256: str
+    expires_at: str
+    max_downloads: int
+    created_at: str
+
+
+class RevokeShareResponse(BaseModel):
+    revoked: bool
+    already_revoked: bool = Field(description="True when the share was already revoked")

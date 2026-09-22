@@ -1,8 +1,8 @@
 # Large File Archive API
 
 基于 FastAPI 的大文件归档服务：分片断点续传、逐片 SHA-256 校验、并发安全的原子合并、
-整文件哈希校验发布、内容寻址去重（重复文件直接复用已有对象）。元数据存 SQLite，
-分片与归档对象存本地卷，启动时自动初始化数据库。
+整文件哈希校验发布、内容寻址去重（重复文件直接复用已有对象），并支持带过期时间与
+次数上限的受控分享下载。元数据存 SQLite，分片与归档对象存本地卷，启动时自动初始化数据库。
 
 ## 快速开始
 
@@ -51,7 +51,10 @@ pytest                 # 运行测试（每个用例使用独立临时数据目�
 | `DELETE` | `/v1/sessions/{id}` | 清理会话：删除暂存分片并释放归档引用（引用计数归零才删对象） |
 | `GET` | `/v1/archives` | 列出归档对象 |
 | `GET` | `/v1/archives/{sha256}` | 归档元数据 |
-| `GET` | `/v1/archives/{sha256}/download` | 下载归档（流式） |
+| `GET` | `/v1/archives/{sha256}/download` | 下载归档（流式，不受分享限制） |
+| `POST` | `/v1/archives/{sha256}/shares` | 创建受控分享（`expires_in` 秒、`max_downloads` 次）；token 仅此一次返回，服务端只存其哈希 |
+| `GET` | `/v1/shares/{token}/download` | 凭 token 下载：事务内校验未撤销/未过期/次数未满并原子扣减，校验失败不扣次数 |
+| `DELETE` | `/v1/shares/{token}` | 撤销分享（幂等，重复撤销返回 `already_revoked: true`） |
 | `GET` | `/healthz` | 健康检查 |
 
 ### curl 示例
@@ -81,6 +84,22 @@ curl -OJ localhost:8000/v1/archives/<整文件sha256>/download
 curl -X DELETE localhost:8000/v1/sessions/$SID
 ```
 
+### 受控分享示例
+
+```bash
+# 1. 为归档创建分享：3600 秒内最多下载 3 次
+#    token 只在此响应中出现一次，服务端不存原文，请妥善保存
+TOKEN=$(curl -s -X POST localhost:8000/v1/archives/<整文件sha256>/shares \
+  -H 'Content-Type: application/json' \
+  -d '{"expires_in": 3600, "max_downloads": 3}' | jq -r .token)
+
+# 2. 凭 token 下载（无需其他凭证；过期/撤销/次数耗尽均返回 410）
+curl -OJ localhost:8000/v1/shares/$TOKEN/download
+
+# 3. 提前撤销
+curl -X DELETE localhost:8000/v1/shares/$TOKEN
+```
+
 ## 设计要点
 
 **数据布局**（`DATA_DIR`，默认容器内 `/data`）
@@ -105,7 +124,21 @@ tmp/<uuid>.tmp             上传/合并临时文件（与 objects 同卷，保�
   合并后发现同内容对象 → 直接复用（`deduplicated: true`）。`DELETE` 会话释放引用，
   计数归零才删除底层对象，共享文件互不影响。
 - 崩溃恢复：启动时把残留的 `merging` 会话重置为 `active`（此时不可能有合并在进行），
-  并清理无属主的分片目录；SQLite 自动建库建表，无需迁移工具。
+  并清理无属主的分片目录；SQLite 自动建库建表（含 `shares` 表），无需迁移工具。
+
+**受控分享**
+
+- token 由 `secrets.token_urlsafe(32)` 生成，仅在创建响应中返回一次；数据库只存其
+  SHA-256（`token_hash`），即使库文件泄露也无法还原可用 token，也无接口可再查询 token。
+- 下载校验与扣减在单条 `BEGIN IMMEDIATE` 事务内完成：依次检查分享存在（404）、
+  未撤销（410）、未过期（410）、次数未满（410），全部通过才 `downloads_used+1` 并提交；
+  任一校验失败即回滚，**不消耗下载次数**。并发请求被 SQLite 写锁串行化，
+  成功下载数精确等于剩余配额，不会超发。文件字节流在事务提交后再发送，
+  长 I/O 不占用数据库写锁。
+- 分享通过外键挂在归档上（`ON DELETE CASCADE`）：归档因引用计数归零被删除时，
+  其全部分享级联失效（token 返回 404）。
+- 分享元数据与归档元数据同库（`archive.db`），随 `archive-data` 卷持久化，
+  进程重启后过期时间与已用次数不丢失；Docker 部署无需新增配置。
 
 **约束与说明**
 
@@ -134,6 +167,8 @@ app/
   storage.py          文件系统布局
   routers/sessions.py 会话与分片端点
   routers/archives.py 归档查询与下载端点
+  routers/shares.py   受控分享端点（创建/下载/撤销）
 tests/test_api.py     端到端测试（乱序/重复/断点/哈希校验/去重/清理）
+tests/test_shares.py  分享测试（配额/过期/撤销/并发扣减/重启持久化）
 Dockerfile / docker-compose.yml
 ```
