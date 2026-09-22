@@ -1,6 +1,8 @@
 """Pydantic request/response models."""
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 _SHA256_PATTERN = r"^[0-9a-fA-F]{64}$"
@@ -90,3 +92,42 @@ class DeleteSessionResponse(BaseModel):
     deleted: bool
     archive_released: bool = Field(description="The session held an archive reference that was released")
     archive_deleted: bool = Field(description="The archive object was removed (refcount reached zero)")
+
+
+class CreateShareRequest(BaseModel):
+    expires_in: int = Field(
+        ge=1,
+        le=60 * 60 * 24 * 365,  # at most one year
+        description="Share lifetime in seconds, starting at creation",
+    )
+    max_downloads: int = Field(
+        ge=1,
+        le=1_000_000,
+        description="Maximum number of successful downloads before the share is exhausted",
+    )
+
+
+class ShareResponse(BaseModel):
+    token: str = Field(
+        description="Opaque share token. Shown exactly once: only its hash is stored server-side."
+    )
+    archive_sha256: str
+    expires_at: str
+    max_downloads: int
+    remaining_downloads: int
+    created_at: str
+
+
+class ShareStatusResponse(BaseModel):
+    archive_sha256: str
+    expires_at: str
+    max_downloads: int
+    downloads_used: int
+    remaining_downloads: int
+    revoked: bool
+    state: Literal["active", "expired", "exhausted", "revoked"]
+    created_at: str
+
+
+class RevokeShareResponse(BaseModel):
+    revoked: bool = Field(description="False when the share was already revoked (call is idempotent)")

@@ -1,7 +1,8 @@
 # Large File Archive API
 
 基于 FastAPI 的大文件归档服务：分片断点续传、逐片 SHA-256 校验、并发安全的原子合并、
-整文件哈希校验发布、内容寻址去重（重复文件直接复用已有对象）。元数据存 SQLite，
+整文件哈希校验发布、内容寻址去重（重复文件直接复用已有对象），以及基于一次性 token 的
+**受控分享下载**（有效期 + 最大下载次数，事务内原子扣减）。元数据存 SQLite，
 分片与归档对象存本地卷，启动时自动初始化数据库。
 
 ## 快速开始
@@ -51,8 +52,25 @@ pytest                 # 运行测试（每个用例使用独立临时数据目�
 | `DELETE` | `/v1/sessions/{id}` | 清理会话：删除暂存分片并释放归档引用（引用计数归零才删对象） |
 | `GET` | `/v1/archives` | 列出归档对象 |
 | `GET` | `/v1/archives/{sha256}` | 归档元数据 |
-| `GET` | `/v1/archives/{sha256}/download` | 下载归档（流式） |
+| `GET` | `/v1/archives/{sha256}/download` | 下载归档（流式，原始端点，始终保留、不受次数限制） |
+| `POST` | `/v1/archives/{sha256}/shares` | 创建受控分享（body：`expires_in` 秒、`max_downloads`）；返回仅展示一次的不可逆 token |
+| `GET` | `/v1/shares/{token}` | 查询分享状态（`active` / `expired` / `exhausted` / `revoked`、剩余次数） |
+| `GET` | `/v1/shares/{token}/download` | 分享下载：事务内校验未过期/未撤销/有剩余次数并原子扣减，随后流式下载；响应头 `X-Share-Remaining-Downloads` 给出剩余次数 |
+| `DELETE` | `/v1/shares/{token}` | 撤销分享（幂等；重复撤销返回 `revoked:false`） |
 | `GET` | `/healthz` | 健康检查 |
+
+### 分享错误码
+
+| 场景 | 状态码 | detail |
+| --- | --- | --- |
+| 归档不存在（创建分享时） | `404` | `archive not found` |
+| 分享不存在/token 错误 | `404` | `share not found` |
+| 分享已过期 | `410` | `share has expired` |
+| 下载次数耗尽 | `410` | `share download limit reached` |
+| 分享已撤销 | `410` | `share has been revoked` |
+
+注意：只有校验通过、成功认领下载时才扣减次数；过期/耗尽/撤销导致的失败**不扣次数**。
+归档被删除（引用计数归零）时，其分享通过外键级联一并删除，token 随即返回 404。
 
 ### curl 示例
 
@@ -81,12 +99,32 @@ curl -OJ localhost:8000/v1/archives/<整文件sha256>/download
 curl -X DELETE localhost:8000/v1/sessions/$SID
 ```
 
+### 受控分享下载示例
+
+```bash
+SHA=<整文件sha256>
+
+# 创建分享：1 小时内有效、最多下载 3 次。token 只在响应里出现这一次，务必保存
+TOKEN=$(curl -s -X POST localhost:8000/v1/archives/$SHA/shares \
+  -H 'Content-Type: application/json' \
+  -d '{"expires_in": 3600, "max_downloads": 3}' | jq -r .token)
+
+# 凭 token 下载（响应头 X-Share-Remaining-Downloads 为剩余次数）
+curl -OJ localhost:8000/v1/shares/$TOKEN/download
+
+# 查询状态：state ∈ active / expired / exhausted / revoked
+curl localhost:8000/v1/shares/$TOKEN
+
+# 撤销分享（幂等）
+curl -X DELETE localhost:8000/v1/shares/$TOKEN
+```
+
 ## 设计要点
 
 **数据布局**（`DATA_DIR`，默认容器内 `/data`）
 
 ```
-archive.db                 SQLite（WAL 模式）
+archive.db                 SQLite（WAL 模式），含 sessions/chunks/archives/shares 表
 chunks/<session>/<i>.part  各会话的分片暂存区
 objects/<aa>/<sha256>      内容寻址的归档对象（去重）
 tmp/<uuid>.tmp             上传/合并临时文件（与 objects 同卷，保证 rename 原子）
@@ -105,7 +143,18 @@ tmp/<uuid>.tmp             上传/合并临时文件（与 objects 同卷，保�
   合并后发现同内容对象 → 直接复用（`deduplicated: true`）。`DELETE` 会话释放引用，
   计数归零才删除底层对象，共享文件互不影响。
 - 崩溃恢复：启动时把残留的 `merging` 会话重置为 `active`（此时不可能有合并在进行），
-  并清理无属主的分片目录；SQLite 自动建库建表，无需迁移工具。
+  并清理无属主的分片目录；SQLite 自动建库建表（含 `shares` 表），无需迁移工具。
+- 受控分享：创建分享时生成 32 字节 CSPRNG 随机 token（URL-safe），数据库只存它的
+  SHA-256（`token_hash` 主键）——即使库文件泄露也无法还原 token，原始 token 仅在创建
+  响应中返回一次。`GET /v1/shares/{token}/download` 在单个 `BEGIN IMMEDIATE` 事务内
+  执行一条带全部前置条件的条件更新：
+  `UPDATE ... SET downloads_used=downloads_used+1 WHERE token_hash=? AND revoked=0
+  AND expires_at > ? AND downloads_used < max_downloads`。
+  `rowcount=0` 即校验失败，事务回滚、**不扣次数**，再按撤销/过期/耗尽返回明确的 410
+  错误；`rowcount=1` 则扣减已随提交生效（WAL + 行级写锁串行化，40 路并发也绝不会
+  超过 `max_downloads`），之后才开始流式传输文件。撤销只置 `revoked=1`，幂等；
+  `shares` 通过外键 `ON DELETE CASCADE` 跟随归档删除；所有分享状态落 SQLite，
+  重启后有效期、剩余次数、撤销状态全部保留。
 
 **约束与说明**
 
@@ -133,7 +182,9 @@ app/
   service.py          合并、恢复等核心逻辑
   storage.py          文件系统布局
   routers/sessions.py 会话与分片端点
-  routers/archives.py 归档查询与下载端点
+  routers/archives.py 归档查询、原始下载端点、创建分享
+  routers/shares.py   受控分享：状态查询、原子认领下载、撤销
 tests/test_api.py     端到端测试（乱序/重复/断点/哈希校验/去重/清理）
+tests/test_shares.py  分享测试（次数/过期/撤销/并发抢占/重启持久化/级联删除）
 Dockerfile / docker-compose.yml
 ```

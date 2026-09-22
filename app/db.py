@@ -46,6 +46,19 @@ CREATE TABLE IF NOT EXISTS archives (
     ref_count  INTEGER NOT NULL DEFAULT 0 CHECK (ref_count >= 0),
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS shares (
+    token_hash     TEXT PRIMARY KEY,
+    archive_sha256 TEXT NOT NULL
+                   REFERENCES archives(sha256) ON DELETE CASCADE,
+    max_downloads  INTEGER NOT NULL CHECK (max_downloads >= 1),
+    downloads_used INTEGER NOT NULL DEFAULT 0
+                   CHECK (downloads_used >= 0 AND downloads_used <= max_downloads),
+    expires_at     TEXT NOT NULL,
+    revoked        INTEGER NOT NULL DEFAULT 0 CHECK (revoked IN (0, 1)),
+    created_at     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_shares_archive ON shares(archive_sha256);
 """
 
 

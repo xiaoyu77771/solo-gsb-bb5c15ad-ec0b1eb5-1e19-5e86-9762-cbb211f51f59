@@ -1,4 +1,4 @@
-"""Archive endpoints: list, inspect, download."""
+"""Archive endpoints: list, inspect, download, controlled shares."""
 from __future__ import annotations
 
 import re
@@ -8,8 +8,9 @@ from fastapi.responses import FileResponse
 
 from ..config import get_settings
 from ..db import db_conn
-from ..schemas import ArchiveResponse
+from ..schemas import ArchiveResponse, CreateShareRequest, ShareResponse
 from ..storage import object_path
+from .shares import create_share
 
 router = APIRouter()
 
@@ -74,3 +75,14 @@ def download_archive(sha256: str) -> FileResponse:
         filename=row["file_name"],
         media_type="application/octet-stream",
     )
+
+
+@router.post("/{sha256}/shares", response_model=ShareResponse, status_code=201)
+def create_archive_share(sha256: str, payload: CreateShareRequest) -> ShareResponse:
+    """Create a controlled download share.
+
+    The opaque token is returned exactly once; only its SHA-256 is stored.
+    Download it via ``GET /v1/shares/{token}/download`` and revoke via
+    ``DELETE /v1/shares/{token}``.
+    """
+    return create_share(_validate_sha(sha256), payload)

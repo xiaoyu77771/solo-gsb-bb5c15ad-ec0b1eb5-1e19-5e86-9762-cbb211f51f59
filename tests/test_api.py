@@ -1,70 +1,14 @@
 """End-to-end tests for the archive API (each test runs on a fresh data dir)."""
 from __future__ import annotations
 
-import hashlib
-
-import pytest
-from fastapi.testclient import TestClient
-
-
-@pytest.fixture()
-def client(tmp_path, monkeypatch):
-    monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
-    from app.config import get_settings
-
-    get_settings.cache_clear()
-    from app.main import app
-
-    with TestClient(app) as test_client:
-        yield test_client
-    get_settings.cache_clear()
-
-
-def _gen(size: int, seed: bytes) -> bytes:
-    """Deterministic pseudo-random content."""
-    out = b""
-    counter = 0
-    while len(out) < size:
-        out += hashlib.sha256(seed + counter.to_bytes(4, "big")).digest()
-        counter += 1
-    return out[:size]
-
-
-def sha256(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
-
-
-def create_session(client: TestClient, data: bytes, chunk_size: int, name: str = "blob.bin"):
-    total = len(data)
-    total_chunks = -(-total // chunk_size)
-    resp = client.post(
-        "/v1/sessions",
-        json={
-            "file_name": name,
-            "total_size": total,
-            "chunk_size": chunk_size,
-            "total_chunks": total_chunks,
-            "file_sha256": sha256(data),
-        },
-    )
-    assert resp.status_code == 201, resp.text
-    return resp.json()
-
-
-def upload_chunk(client: TestClient, session_id: str, data: bytes, chunk_size: int, index: int):
-    piece = data[index * chunk_size : (index + 1) * chunk_size]
-    return client.put(
-        f"/v1/sessions/{session_id}/chunks/{index}",
-        content=piece,
-        headers={"X-Chunk-SHA256": sha256(piece)},
-    )
-
-
-def upload_all(client: TestClient, session_id: str, data: bytes, chunk_size: int, order=None):
-    total_chunks = -(-len(data) // chunk_size)
-    for index in (order if order is not None else range(total_chunks)):
-        resp = upload_chunk(client, session_id, data, chunk_size, index)
-        assert resp.status_code == 200, resp.text
+from .conftest import (
+    create_session,
+    gen as _gen,
+    publish_archive,
+    sha256,
+    upload_all,
+    upload_chunk,
+)
 
 
 def test_full_flow_out_of_order_with_duplicate(client):
@@ -250,3 +194,14 @@ def test_unknown_session_404(client):
     assert client.get("/v1/sessions/nope").status_code == 404
     assert client.post("/v1/sessions/nope/complete").status_code == 404
     assert client.delete("/v1/sessions/nope").status_code == 404
+
+
+def test_legacy_download_endpoint_still_served(client):
+    """The original unconstrained download endpoint remains available."""
+    data = _gen(120_000, b"legacy")
+    sha = publish_archive(client, data)
+    first = client.get(f"/v1/archives/{sha}/download")
+    assert first.status_code == 200
+    assert first.content == data
+    # No quota: repeatable forever.
+    assert client.get(f"/v1/archives/{sha}/download").content == data
